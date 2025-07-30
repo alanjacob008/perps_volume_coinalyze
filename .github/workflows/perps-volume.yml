@@ -4,6 +4,9 @@ on:
   schedule:
     - cron: '0 5 * * *'  # Run daily at 05:00 UTC
   workflow_dispatch:     # Enable manual run
+  
+permissions:
+  contents: write 
 
 jobs:
   update-perps-volume:
