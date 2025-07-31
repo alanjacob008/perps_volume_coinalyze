@@ -1,131 +1,126 @@
-import requests
+#!/usr/bin/env python3
+import os, json, time, requests
 import pandas as pd
-import time
-import os
-import json
 from datetime import datetime, timedelta
 from tqdm import tqdm
 
-API_KEY = os.getenv("COINALYZE_API_KEY")
-BASE_URL = "https://api.coinalyze.net/v1"
-HEADERS = {"api_key": API_KEY}
-DATA_FILE = "data/perps_volume_data.json"
-DELAY = 1.5  # seconds between requests
-TARGET_TOKENS = {"BTC", "ETH", "BNB", "SOL", "HYPE"}
-START_DATE = datetime(2024, 6, 1)
+API_KEY       = os.getenv("COINALYZE_API_KEY")
+BASE_URL      = "https://api.coinalyze.net/v1"
+HEADERS       = {"api_key": API_KEY}
+DATA_FILE     = "data/perps_volume_data.json"
+DELAY         = 1.5
+TARGET_TOKENS = {"BTC","ETH","BNB","SOL","HYPE"}
+START_DATE    = datetime(2024,6,1)
 
 def get_daily_ohlcv(symbol, from_ts, to_ts):
-    params = {
-        "symbols": symbol,
-        "interval": "daily",
-        "from": from_ts,
-        "to": to_ts
-    }
-    res = requests.get(f"{BASE_URL}/ohlcv-history", headers=HEADERS, params=params)
-    if res.status_code == 429:
-        retry = int(res.headers.get("Retry-After", 5))
-        print(f"Rate limited. Sleeping for {retry} seconds...")
-        time.sleep(retry)
-        return get_daily_ohlcv(symbol, from_ts, to_ts)
-    res.raise_for_status()
-    data = res.json()
-    return data[0]["history"] if data and "history" in data[0] else []
-
-def load_existing_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
-    return []
-
-def get_existing_dates(data):
-    return set((row["Date"], row["Exchange"]) for row in data)
+    r = requests.get(f"{BASE_URL}/ohlcv-history",
+                     headers=HEADERS,
+                     params={"symbols":symbol,"interval":"daily","from":from_ts,"to":to_ts})
+    if r.status_code==429:
+        wait = float(r.headers.get("Retry-After","5"))
+        time.sleep(wait)
+        return get_daily_ohlcv(symbol,from_ts,to_ts)
+    r.raise_for_status()
+    data = r.json()
+    return data[0].get("history",[]) if data else []
 
 def fetch_perp_markets():
-    markets = requests.get(f"{BASE_URL}/future-markets", headers=HEADERS).json()
-    exchanges = requests.get(f"{BASE_URL}/exchanges", headers=HEADERS).json()
-    ex_map = {e["code"]: e["name"] for e in exchanges}
-
-    filtered = []
-    for m in markets:
-        if m["is_perpetual"] and m["base_asset"] in TARGET_TOKENS:
-            filtered.append({
-                "exchange_code": m["exchange"],
-                "exchange_name": ex_map.get(m["exchange"], m["exchange"]),
-                "symbol": m["symbol"],
+    mkts = requests.get(f"{BASE_URL}/future-markets", headers=HEADERS).json()
+    exs  = requests.get(f"{BASE_URL}/exchanges",     headers=HEADERS).json()
+    exmap= {e["code"]:e["name"] for e in exs}
+    out=[]
+    for m in mkts:
+        if m.get("is_perpetual") and m.get("base_asset") in TARGET_TOKENS:
+            out.append({
+                "exchange":   exmap.get(m["exchange"],m["exchange"]),
+                "symbol":     m["symbol"],
                 "base_asset": m["base_asset"]
             })
-    return filtered
+    return pd.DataFrame(out)
+
+def load_existing_dates():
+    if not os.path.exists(DATA_FILE):
+        return []
+    with open(DATA_FILE) as f:
+        arr = json.load(f)
+    return sorted(set(row["Date"] for row in arr))
+
+def append_rows(rows):
+    # ensure data dir
+    os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
+    lines = [json.dumps(r, separators=(",",":"), ensure_ascii=False) for r in rows]
+    if not os.path.exists(DATA_FILE):
+        # first-time create
+        with open(DATA_FILE,"w") as f:
+            f.write("[\n")
+            f.write(",\n".join(lines))
+            f.write("\n]")
+    else:
+        # preserve existing exactly, then append
+        with open(DATA_FILE,"r") as f:
+            text = f.read().rstrip()
+        # strip final ']'
+        assert text.endswith("]"), "Malformed JSON, missing closing ]"
+        prefix = text[:-1].rstrip()
+        # append new lines
+        new_text = prefix + ",\n" + "\n".join(lines) + "\n]"
+        with open(DATA_FILE,"w") as f:
+            f.write(new_text)
 
 def main():
-    today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-    existing = load_existing_data()
-    existing_keys = get_existing_dates(existing)
-
-    markets = fetch_perp_markets()
-    df = pd.DataFrame(markets)
-
-    output = []
-
-    if existing:
-        latest_date_str = max(row["Date"] for row in existing)
-        start_date = datetime.strptime(latest_date_str, "%Y-%m-%d") + timedelta(days=1)
+    today = datetime.utcnow().replace(hour=0,minute=0,second=0,microsecond=0)
+    last_existing = load_existing_dates()
+    if last_existing:
+        # missing dates are those from (first or last?) — we'll backfill holes later
+        existing_set = set(last_existing)
     else:
-        start_date = START_DATE
+        existing_set = set()
 
+    # build full calendar from START_DATE to yesterday
     end_date = today - timedelta(days=1)
-    if start_date > end_date:
-        print("✅ No new data to fetch. Already up to date.")
+    days = (end_date - START_DATE).days + 1
+    all_dates = [(START_DATE+timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days)]
+
+    missing_dates = [d for d in all_dates if d not in existing_set]
+    if not missing_dates:
+        print("✅ No missing dates. Up to date.")
         return
 
-    days = (end_date - start_date).days + 1
-    for delta in range(days):
-        date = start_date + timedelta(days=delta)
-        date_str = date.strftime("%Y-%m-%d")
-        from_ts = int(date.timestamp())
-        to_ts = int((date + timedelta(days=1)).timestamp())
+    df = fetch_perp_markets()
+    new_rows = []
+    for date_str in tqdm(missing_dates, desc="Backfilling dates"):
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        from_ts = int(dt.timestamp())
+        to_ts   = int((dt+timedelta(days=1)).timestamp())
 
-        # Reset daily map
-        day_exchange_map = {}
-
-        for _, row in tqdm(df.iterrows(), total=len(df), desc=f"Fetching {date_str}"):
-            symbol = row["symbol"]
-            token = row["base_asset"]
-            exchange = row["exchange_name"]
-
-            if (date_str, exchange) in existing_keys:
-                continue
-
+        # aggregate per exchange
+        daily = {}
+        for _,row in df.iterrows():
+            exch = row["exchange"]
+            sym  = row["symbol"]
+            tok  = row["base_asset"]
             try:
-                candles = get_daily_ohlcv(symbol, from_ts, to_ts)
-            except Exception as e:
-                print(f"Error fetching {symbol}: {e}")
+                candles = get_daily_ohlcv(sym, from_ts, to_ts)
+            except Exception:
                 continue
-
             for c in candles:
-                if "t" not in c or "v" not in c or "c" not in c:
+                if not all(k in c for k in ("v","c")):
                     continue
-                usd_volume = c["v"] * c["c"]
-                if exchange not in day_exchange_map:
-                    day_exchange_map[exchange] = {t: 0 for t in TARGET_TOKENS}
-                day_exchange_map[exchange][token] += usd_volume
-
+                vol = c["v"]*c["c"]
+                daily.setdefault(exch,{t:0 for t in TARGET_TOKENS})
+                daily[exch][tok] += vol
             time.sleep(DELAY)
 
-        # Append all daily entries
-        for exchange, token_map in day_exchange_map.items():
-            row = {
-                "Date": date_str,
-                "Exchange": exchange,
-                **{token: round(token_map.get(token, 0), 2) for token in TARGET_TOKENS},
-                "Total": round(sum(token_map.values()), 2)
-            }
-            output.append(row)
+        for exch,tm in daily.items():
+            entry = {"Date":date_str,"Exchange":exch}
+            # fill tokens
+            for t in TARGET_TOKENS:
+                entry[t] = round(tm.get(t,0),2)
+            entry["Total"] = round(sum(tm.values()),2)
+            new_rows.append(entry)
 
-    combined = existing + output
-    os.makedirs("data", exist_ok=True)
-    with open(DATA_FILE, "w") as f:
-        json.dump(combined, f, indent=2)
-    print(f"✅ Updated {DATA_FILE} with {len(output)} new rows.")
+    append_rows(new_rows)
+    print(f"✅ Appended {len(new_rows)} rows for dates: {missing_dates}")
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
