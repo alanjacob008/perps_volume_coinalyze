@@ -46,26 +46,32 @@ def load_existing_dates():
     return sorted(set(row["Date"] for row in arr))
 
 def append_rows(rows):
-    # ensure data dir
     os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
-    lines = [json.dumps(r, separators=(",",":"), ensure_ascii=False) for r in rows]
-    if not os.path.exists(DATA_FILE):
-        # first-time create
-        with open(DATA_FILE,"w") as f:
-            f.write("[\n")
-            f.write(",\n".join(lines))
-            f.write("\n]")
-    else:
-        # preserve existing exactly, then append
-        with open(DATA_FILE,"r") as f:
-            text = f.read().rstrip()
-        # strip final ']'
-        assert text.endswith("]"), "Malformed JSON, missing closing ]"
-        prefix = text[:-1].rstrip()
-        # append new lines
-        new_text = prefix + ",\n" + "\n".join(lines) + "\n]"
-        with open(DATA_FILE,"w") as f:
-            f.write(new_text)
+
+    # Try to load existing cleanly
+    existing = []
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r") as f:
+                existing = json.load(f)
+        except json.JSONDecodeError as e:
+            print(f"⚠️ Skipping append: existing JSON is malformed — {e}")
+            return
+
+    # Deduping: build unique (Date + Exchange) map
+    existing_map = {(r["Date"], r["Exchange"]): r for r in existing}
+    for r in rows:
+        key = (r["Date"], r["Exchange"])
+        existing_map[key] = r  # overwrite if exists
+
+    # Final sorted list
+    combined = list(existing_map.values())
+    combined.sort(key=lambda x: (x["Date"], x["Exchange"]))
+
+    # Write to file
+    with open(DATA_FILE, "w") as f:
+        json.dump(combined, f, indent=2)
+    print(f"✅ Saved {len(combined)} rows to {DATA_FILE}")
 
 def main():
     today = datetime.utcnow().replace(hour=0,minute=0,second=0,microsecond=0)
